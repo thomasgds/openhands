@@ -132,14 +132,46 @@ static int cmd_scp(int argc, char **argv)
     return 0;
 }
 
+/* Shell 命令: telnet <host> [port] — Telnet 客户端，调用系统 telnet */
+static int cmd_telnet(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: telnet <host> [port]\n");
+        printf("Examples:\n");
+        printf("  telnet 192.168.1.1\n");
+        printf("  telnet 10.0.2.2 23\n");
+        return -1;
+    }
+
+    const char *host = argv[1];
+    int port = (argc > 2) ? atoi(argv[2]) : 23;
+    if (port <= 0) port = 23;
+
+    printf("Connecting to %s:%d ...\n", host, port);
+    printf("  (press Ctrl+] to close connection)\n\n");
+
+    char buf[4096];
+    snprintf(buf, sizeof(buf), "telnet %s %d", host, port);
+    int ret = system(buf);
+
+    if (ret == -1 || WEXITSTATUS(ret) == 127) {
+        printf("telnet: 'telnet' command not found (trying busybox telnet)...\n");
+        snprintf(buf, sizeof(buf), "busybox telnet %s %d", host, port);
+        ret = system(buf);
+    }
+
+    return ret;
+}
+
 void shell_shell_net_init(void) { LOG_INFO("shell_net initialized"); }
 
 /* 直接调用来注册 */
 void shell_register_net_cmds(void)
 {
     static const shell_cmd_t net_cmds[] = {
-        {"ssh", "SSH client: ssh <user@host> <command>", cmd_ssh},
-        {"scp", "SCP file transfer (use FTP instead)", cmd_scp},
+        {"ssh",     "SSH client: ssh <user@host> <command>", cmd_ssh},
+        {"scp",     "SCP file transfer (use FTP instead)", cmd_scp},
+        {"telnet",  "Telnet client: telnet <host> [port]", cmd_telnet},
     };
     int n = sizeof(net_cmds) / sizeof(net_cmds[0]);
     for (int i = 0; i < n; i++)

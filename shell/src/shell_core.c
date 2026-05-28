@@ -20,6 +20,7 @@ extern void shell_register_all_commands(void);
 extern void shell_register_net_cmds(void);
 extern void shell_register_sys_cmds(void);
 extern void shell_register_fs_cmds(void);
+extern void shell_shell_reload_init(void);
 
 void shell_register_cmd(const shell_cmd_t *cmd)
 {
@@ -141,6 +142,7 @@ void shell_init(void)
     shell_register_net_cmds();
     shell_register_sys_cmds();
     shell_register_fs_cmds();
+    shell_shell_reload_init();
     task_create("shell", shell_task, NULL, 0, TASK_PRIORITY_NORMAL);
     LOG_INFO("Shell initialized (%d commands)", s_num_cmds);
 }

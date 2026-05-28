@@ -1,0 +1,20 @@
+#include "ff.h"
+FRESULT f_open(void) { return FR_OK; }
+FRESULT f_close(void) { return FR_OK; }
+FRESULT f_read(void) { return FR_OK; }
+FRESULT f_write(void) { return FR_OK; }
+FRESULT f_lseek(void) { return FR_OK; }
+FRESULT f_mkdir(void) { return FR_OK; }
+FRESULT f_unlink(void) { return FR_OK; }
+FRESULT f_rename(void) { return FR_OK; }
+FRESULT f_stat(void) { return FR_OK; }
+FRESULT f_opendir(void) { return FR_OK; }
+FRESULT f_readdir(void) { return FR_OK; }
+FRESULT f_closedir(void) { return FR_OK; }
+FRESULT f_mount(void) { return FR_OK; }
+FRESULT f_getfree(void) { return FR_OK; }
+FRESULT f_getcwd(void) { return FR_OK; }
+FRESULT f_chdir(void) { return FR_OK; }
+FRESULT f_sync(void) { return FR_OK; }
+FRESULT f_forward(void) { return FR_OK; }
+int f_printf(void) { return 0; }

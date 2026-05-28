@@ -100,40 +100,67 @@ static int ping_host(struct in_addr addr, int count, int timeout_ms)
         }
         sent++;
 
-        /* 接收回复 */
-        struct sockaddr_in from;
-        socklen_t fromlen = sizeof(from);
+        /* 对当前 seq: 循环 recv 直到收到匹配的回复或超时 */
+        struct timeval deadline;
+        gettimeofday(&deadline, NULL);
+        deadline.tv_usec += timeout_ms * 1000;
+        deadline.tv_sec += deadline.tv_usec / 1000000;
+        deadline.tv_usec %= 1000000;
 
-        n = recvfrom(sock, recv_buf, sizeof(recv_buf), 0,
-                     (struct sockaddr *)&from, &fromlen);
-        if (n < 0) {
-            printf("Request timeout for icmp_seq=%d\n", seq);
-            continue;
-        }
+        bool got_reply = false;
 
-        struct iphdr *iph = (struct iphdr *)recv_buf;
-        int iph_len = iph->ihl * 4;
-        struct icmphdr *icmp_reply = (struct icmphdr *)(recv_buf + iph_len);
-
-        if (icmp_reply->type == ICMP_ECHOREPLY &&
-            icmp_reply->un.echo.id == htons(getpid() & 0xFFFF)) {
-
-            received++;
-            struct timeval *tv_sent = (struct timeval *)(recv_buf + iph_len + sizeof(struct icmphdr));
-            struct timeval now, diff;
+        while (!got_reply) {
+            struct timeval now;
             gettimeofday(&now, NULL);
-            diff = tv_diff(tv_sent, &now);
+            long left_ms = (deadline.tv_sec - now.tv_sec) * 1000 +
+                           (deadline.tv_usec - now.tv_usec) / 1000;
+            if (left_ms <= 0) break;
+
+            struct timeval rcv_tv;
+            rcv_tv.tv_sec = left_ms / 1000;
+            rcv_tv.tv_usec = (left_ms % 1000) * 1000;
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &rcv_tv, sizeof(rcv_tv));
+
+            struct sockaddr_in from;
+            socklen_t fromlen = sizeof(from);
+
+            n = recvfrom(sock, recv_buf, sizeof(recv_buf), 0,
+                         (struct sockaddr *)&from, &fromlen);
+            if (n < 0) break;
+
+            struct iphdr *iph = (struct iphdr *)recv_buf;
+            int iph_len = iph->ihl * 4;
+            struct icmphdr *icmp_reply = (struct icmphdr *)(recv_buf + iph_len);
+
+            /* 忽略自己发出的 ECHO (type=8) */
+            if (icmp_reply->type == ICMP_ECHO) continue;
+            /* 只处理 ECHO REPLY */
+            if (icmp_reply->type != ICMP_ECHOREPLY) continue;
+            /* ID 必须匹配 */
+            if (icmp_reply->un.echo.id != htons(getpid() & 0xFFFF)) continue;
+            /* 只处理当前 seq（或之前的未收包） */
+            int reply_seq = ntohs(icmp_reply->un.echo.sequence);
+            if (reply_seq != seq) continue;
+
+            got_reply = true;
+            received++;
+
+            struct timeval *tv_sent_pkt = (struct timeval *)(recv_buf + iph_len + sizeof(struct icmphdr));
+            struct timeval reply_now, diff;
+            gettimeofday(&reply_now, NULL);
+            diff = tv_diff(tv_sent_pkt, &reply_now);
 
             printf("%zd bytes from %s: icmp_seq=%d ttl=%d time=%ld.%03ld ms\n",
                    n - iph_len,
                    inet_ntoa(from.sin_addr),
-                   seq,
+                   reply_seq,
                    iph->ttl,
                    (long)diff.tv_sec * 1000 + diff.tv_usec / 1000,
                    (long)diff.tv_usec % 1000);
-        } else {
-            printf("Unexpected ICMP type %d from %s\n",
-                   icmp_reply->type, inet_ntoa(from.sin_addr));
+        }
+
+        if (!got_reply) {
+            printf("Request timeout for icmp_seq=%d\n", seq);
         }
 
         /* 发送间隔 1 秒 */

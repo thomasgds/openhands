@@ -144,8 +144,8 @@ static int ssh_connect(const char *host, int port, const char *user,
         int oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
         fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
 
-        char obuf[4096];
-        size_t obuf_len = 0;
+        /* 把终端设为 raw 模式，让输入字符直接透传 */
+        system("stty raw -echo < /dev/tty 2>/dev/null");
 
         while (1) {
             struct timeval tv;
@@ -154,14 +154,14 @@ static int ssh_connect(const char *host, int port, const char *user,
             FD_SET(sock, &fds);
             FD_SET(STDIN_FILENO, &fds);
             tv.tv_sec = 0;
-            tv.tv_usec = 100000; /* 100ms */
+            tv.tv_usec = 50000; /* 50ms */
 
             int maxfd = (sock > STDIN_FILENO) ? sock : STDIN_FILENO;
             int sel = select(maxfd + 1, &fds, NULL, NULL, &tv);
-            if (sel < 0) break;
 
-            /* 从远端读输出 */
-            if (FD_ISSET(sock, &fds)) {
+            /* 即使 select 没触发，也要尝试从 channel 读，
+               因为 libssh2 内部可能已经缓存了数据 */
+            {
                 char rbuf[4096];
                 int n = libssh2_channel_read(channel, rbuf, sizeof(rbuf));
                 if (n > 0) {
@@ -175,11 +175,18 @@ static int ssh_connect(const char *host, int port, const char *user,
 
             /* 检查远端是否关闭了通道 */
             if (libssh2_channel_eof(channel)) {
+                /* 尝试读完剩余数据 */
+                char rbuf[4096];
+                int n;
+                while ((n = libssh2_channel_read(channel, rbuf, sizeof(rbuf))) > 0) {
+                    fwrite(rbuf, 1, n, stdout);
+                    fflush(stdout);
+                }
                 break;
             }
 
-            /* 从 stdin 读输入 */
-            if (FD_ISSET(STDIN_FILENO, &fds)) {
+            /* 从 stdin 读输入（如果 select 说有数据） */
+            if (sel > 0 && FD_ISSET(STDIN_FILENO, &fds)) {
                 char ibuf[1024];
                 int n = read(STDIN_FILENO, ibuf, sizeof(ibuf));
                 if (n > 0) {
@@ -190,19 +197,16 @@ static int ssh_connect(const char *host, int port, const char *user,
                     /* EOF (Ctrl+D) */
                     libssh2_channel_send_eof(channel);
                     break;
+                } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    break;
                 }
             }
 
-            /* 从输出缓冲 flush */
-            if (obuf_len > 0) {
-                int wrote = libssh2_channel_write(channel, obuf, obuf_len);
-                if (wrote > 0) {
-                    memmove(obuf, obuf + wrote, obuf_len - wrote);
-                    obuf_len -= wrote;
-                }
-            }
+            if (sel < 0) break;
         }
 
+        /* 恢复终端设置 */
+        system("stty sane < /dev/tty 2>/dev/null");
         /* 恢复 stdin 阻塞模式 */
         fcntl(STDIN_FILENO, F_SETFL, oldf);
         printf("\n--- SSH session closed ---\n");

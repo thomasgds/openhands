@@ -21,6 +21,7 @@
 static pthread_mutex_t s_lwip_lock = PTHREAD_MUTEX_INITIALIZER;
 static int s_tap_fd = -1;
 static bool s_net_running = false;
+static bool s_net_configured = false;  /* 网络栈已配置好（即使 TAP 不可用） */
 
 /* TCP/IP 协议栈状态（模拟） */
 typedef struct {
@@ -78,8 +79,21 @@ void netif_rtos_poll(void)
     if (s_tap_fd < 0 || !s_net_running) return;
 }
 
-bool netif_is_up(void) { return s_net_running && s_tap_fd >= 0; }
+bool netif_is_up(void)
+{
+    return s_net_configured;
+}
+
+bool netif_tap_is_connected(void)
+{
+    return s_net_running && s_tap_fd >= 0;
+}
+
 const char *netif_get_ip(void) { return s_netif.ipaddr; }
+const char *netif_get_gateway(void) { return s_netif.gateway; }
+const char *netif_get_netmask(void) { return s_netif.netmask; }
+uint32_t netif_get_packets_rx(void) { return s_netif.packets_rx; }
+uint32_t netif_get_packets_tx(void) { return s_netif.packets_tx; }
 
 void lwip_init_rtos(void)
 {
@@ -97,6 +111,8 @@ void lwip_init_rtos(void)
     strncpy(s_netif.ipaddr, TAP_ADDR, sizeof(s_netif.ipaddr) - 1);
     strncpy(s_netif.netmask, TAP_NETMASK, sizeof(s_netif.netmask) - 1);
     strncpy(s_netif.gateway, TAP_GATEWAY, sizeof(s_netif.gateway) - 1);
+
+    s_net_configured = true;  /* 网络栈配置完成，至少支持 loopback */
 
     LOG_INFO("lwIP initialized (netif: %s, IP: %s)", s_netif.ifname, s_netif.ipaddr);
 }

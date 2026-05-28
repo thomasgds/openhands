@@ -18,24 +18,31 @@ static void worker_task(void *arg)
     int count = 0;
     while (count < 3) {
         mutex_lock(s_print_lock);
-        printf("[%s] Hello from RTOS task! count=%d\n", name, count++);
+        printf("[%s] count=%d\n", name, count++);
         mutex_unlock(s_print_lock);
         task_sleep(400 + (rand() % 400));
     }
-    printf("[%s] Task completed.\n", name);
+    mutex_lock(s_print_lock);
+    printf("[%s] Done.\n", name);
+    mutex_unlock(s_print_lock);
     task_exit();
 }
 
 static void demo_scheduler(void *arg)
 {
     (void)arg;
-    printf("\n=== Phase 1: Multi-task Demo ===\n");
+    task_sleep(100);
+    mutex_lock(s_print_lock);
+    printf("\n=== Phase 1: Multi-task Demo ===\n\n");
+    mutex_unlock(s_print_lock);
 
-    task_create("WorkerA", worker_task, "WorkerA", 0, TASK_PRIORITY_NORMAL);
-    task_create("WorkerB", worker_task, "WorkerB", 0, TASK_PRIORITY_NORMAL);
-    task_create("WorkerC", worker_task, "WorkerC", 0, TASK_PRIORITY_LOW);
+    task_create("WorkerA", worker_task, "WkrA", 0, TASK_PRIORITY_NORMAL);
+    task_create("WorkerB", worker_task, "WkrB", 0, TASK_PRIORITY_NORMAL);
+    task_create("WorkerC", worker_task, "WkrC", 0, TASK_PRIORITY_LOW);
 
-    printf("[Demo] 3 tasks created, system running.\n");
+    mutex_lock(s_print_lock);
+    printf("[Demo] 3 worker tasks created\n");
+    mutex_unlock(s_print_lock);
     task_exit();
 }
 

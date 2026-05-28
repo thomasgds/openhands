@@ -18,5 +18,8 @@ void svc_mgr_init(void)
     task_create("ftpd", (task_func_t)ftpd_start, NULL, 0, TASK_PRIORITY_NORMAL);
     LOG_INFO("  -> FTP server task created (port 21)");
 
+    task_create("sshd", (task_func_t)sshd_start, NULL, 0, TASK_PRIORITY_NORMAL);
+    LOG_INFO("  -> SSH server task created (port 22/2222)");
+
     LOG_INFO("All network services started");
 }

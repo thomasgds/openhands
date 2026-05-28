@@ -7,10 +7,12 @@
 #include <stdbool.h>
 #include <libssh2.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <errno.h>
+#include <fcntl.h>
 
 /* ============================================================
  *   SSH 客户端 — 使用 libssh2
@@ -78,48 +80,138 @@ static int ssh_connect(const char *host, int port, const char *user,
 
     printf("ssh: connected to %s as %s\n", host, user);
 
-    /* 打开通道并执行命令 */
-    LIBSSH2_CHANNEL *channel = libssh2_channel_open_session(session);
-    if (!channel) {
-        printf("ssh: channel open failed\n");
-        libssh2_session_free(session);
-        close(sock);
-        return -1;
-    }
-
     if (cmd) {
+        /* 单命令模式：打开通道 -> exec -> 读输出 -> 退出 */
+        LIBSSH2_CHANNEL *channel = libssh2_channel_open_session(session);
+        if (!channel) {
+            printf("ssh: channel open failed\n");
+            libssh2_session_free(session);
+            close(sock);
+            return -1;
+        }
+
         rc = libssh2_channel_exec(channel, cmd);
-    } else {
-        rc = libssh2_channel_shell(channel);
-    }
-    if (rc) {
-        printf("ssh: exec failed (code=%d)\n", rc);
+        if (rc) {
+            printf("ssh: exec failed (code=%d)\n", rc);
+            libssh2_channel_close(channel);
+            libssh2_channel_free(channel);
+            libssh2_session_free(session);
+            close(sock);
+            return -1;
+        }
+
+        /* 读取输出 */
+        char buf[4096];
+        while (1) {
+            int n = libssh2_channel_read(channel, buf, sizeof(buf) - 1);
+            if (n <= 0) break;
+            buf[n] = '\0';
+            printf("%s", buf);
+        }
+
+        libssh2_channel_send_eof(channel);
+        libssh2_channel_wait_eof(channel);
         libssh2_channel_close(channel);
         libssh2_channel_free(channel);
-        libssh2_session_free(session);
-        close(sock);
-        return -1;
+    } else {
+        /* 交互式 shell 模式：打开 channel shell -> stdin/stdout 双向转发 */
+        LIBSSH2_CHANNEL *channel = libssh2_channel_open_session(session);
+        if (!channel) {
+            printf("ssh: channel open failed\n");
+            libssh2_session_free(session);
+            close(sock);
+            return -1;
+        }
+
+        rc = libssh2_channel_shell(channel);
+        if (rc) {
+            printf("ssh: shell open failed (code=%d)\n", rc);
+            libssh2_channel_close(channel);
+            libssh2_channel_free(channel);
+            libssh2_session_free(session);
+            close(sock);
+            return -1;
+        }
+
+        /* 设置非阻塞，以便 select 轮询 */
+        libssh2_session_set_blocking(session, 0);
+
+        printf("\n--- Interactive SSH session ---\n");
+        printf("  Type your commands. Use Ctrl+D or 'exit' to disconnect.\n\n");
+
+        /* stdin 设为非阻塞 */
+        int oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
+        fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
+
+        char obuf[4096];
+        size_t obuf_len = 0;
+
+        while (1) {
+            struct timeval tv;
+            fd_set fds;
+            FD_ZERO(&fds);
+            FD_SET(sock, &fds);
+            FD_SET(STDIN_FILENO, &fds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 100000; /* 100ms */
+
+            int maxfd = (sock > STDIN_FILENO) ? sock : STDIN_FILENO;
+            int sel = select(maxfd + 1, &fds, NULL, NULL, &tv);
+            if (sel < 0) break;
+
+            /* 从远端读输出 */
+            if (FD_ISSET(sock, &fds)) {
+                char rbuf[4096];
+                int n = libssh2_channel_read(channel, rbuf, sizeof(rbuf));
+                if (n > 0) {
+                    fwrite(rbuf, 1, n, stdout);
+                    fflush(stdout);
+                } else if (n < 0 && n != LIBSSH2_ERROR_EAGAIN) {
+                    /* 通道关闭 */
+                    break;
+                }
+            }
+
+            /* 检查远端是否关闭了通道 */
+            if (libssh2_channel_eof(channel)) {
+                break;
+            }
+
+            /* 从 stdin 读输入 */
+            if (FD_ISSET(STDIN_FILENO, &fds)) {
+                char ibuf[1024];
+                int n = read(STDIN_FILENO, ibuf, sizeof(ibuf));
+                if (n > 0) {
+                    /* 写入远端 */
+                    int wrote = libssh2_channel_write(channel, ibuf, n);
+                    (void)wrote;
+                } else if (n == 0) {
+                    /* EOF (Ctrl+D) */
+                    libssh2_channel_send_eof(channel);
+                    break;
+                }
+            }
+
+            /* 从输出缓冲 flush */
+            if (obuf_len > 0) {
+                int wrote = libssh2_channel_write(channel, obuf, obuf_len);
+                if (wrote > 0) {
+                    memmove(obuf, obuf + wrote, obuf_len - wrote);
+                    obuf_len -= wrote;
+                }
+            }
+        }
+
+        /* 恢复 stdin 阻塞模式 */
+        fcntl(STDIN_FILENO, F_SETFL, oldf);
+        printf("\n--- SSH session closed ---\n");
+
+        libssh2_channel_send_eof(channel);
+        libssh2_channel_wait_eof(channel);
+        libssh2_channel_close(channel);
+        libssh2_channel_free(channel);
     }
 
-    /* 读取输出 */
-    char buf[4096];
-    while (1) {
-        int n = libssh2_channel_read(channel, buf, sizeof(buf) - 1);
-        if (n <= 0) break;
-        buf[n] = '\0';
-        printf("%s", buf);
-    }
-
-    /* 交互式 shell 模式（无命令时） */
-    if (!cmd) {
-        printf("\nssh: interactive shell not supported, use: ssh <host> <cmd>\n");
-    }
-
-    /* 关闭 */
-    libssh2_channel_send_eof(channel);
-    libssh2_channel_wait_eof(channel);
-    libssh2_channel_close(channel);
-    libssh2_channel_free(channel);
     libssh2_session_free(session);
     close(sock);
 

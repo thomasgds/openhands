@@ -13,6 +13,7 @@
 #include <netdb.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/wait.h>
 
 /* ============================================================
  *   SSH 客户端 — 使用 libssh2
@@ -264,6 +265,22 @@ static int cmd_ssh(int argc, char **argv)
         cmd = argv[2];
     }
 
+    /* 交互式 SSH 需要 fork 子进程来独占终端 I/O */
+    if (!cmd) {
+        pid_t pid = fork();
+        if (pid < 0) {
+            printf("ssh: fork failed\n");
+            return -1;
+        }
+        if (pid > 0) {
+            /* 父进程：等待子进程结束 */
+            int status;
+            waitpid(pid, &status, 0);
+            return 0;
+        }
+        /* 子进程：继续执行 */
+    }
+
     /* 密码：优先环境变量 SSH_PASS，其次从 stdin 交互读取 */
     char pass[256] = "";
     char *env_pass = getenv("SSH_PASS");
@@ -302,7 +319,14 @@ static int cmd_ssh(int argc, char **argv)
     printf("Connecting to %s@%s:%d ...\n", user, host, port);
     if (cmd) printf("Command: %s\n", cmd);
 
-    return ssh_connect(host, port, user, pass, cmd);
+    int ret = ssh_connect(host, port, user, pass, cmd);
+
+    /* 如果是 fork 出来的子进程，退出 */
+    if (!cmd) {
+        _exit(ret == 0 ? 0 : 1);
+    }
+
+    return ret;
 }
 
 /* Shell 命令: scp — 按 SSH 连接方式复用 */

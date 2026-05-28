@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <unistd.h>
+#include <sys/select.h>
 
 #define MAX_CMDS 64
 #define MAX_ARGS 32
@@ -107,19 +109,18 @@ static void shell_task(void *arg)
     (void)arg;
     char line[MAX_LINE];
 
-    printf("\n====================================\n");
+    printf("====================================\n");
     printf("  RTOS Shell v1.0\n");
     printf("  Type 'help' for commands\n");
     printf("====================================\n");
 
     while (!s_shell_exit) {
-        printf("\nrtos> ");
+        printf("rtos> ");
         fflush(stdout);
 
         if (!fgets(line, sizeof(line), stdin))
             break;
 
-        /* 去除尾部换行 */
         size_t len = strlen(line);
         if (len > 0 && line[len - 1] == '\n')
             line[len - 1] = '\0';

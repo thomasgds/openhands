@@ -53,8 +53,13 @@ void rtos_start(void)
     /* Start network services */
     svc_mgr_init();
 
-    /* Scheduler never returns */
+    /* Start scheduler timer */
     task_scheduler_start();
+
+    LOG_INFO("RTOS is running. Waiting for tasks to complete...");
+
+    /* 等待所有任务结束 */
+    task_join_all();
 
     s_kernel_running = false;
     LOG_INFO("RTOS stopped.");

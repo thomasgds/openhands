@@ -10,7 +10,7 @@ CFLAGS  += -I$(CURDIR)/net/include
 CFLAGS  += -I$(CURDIR)/shell/include
 CFLAGS  += -I$(CURDIR)/services/include
 CFLAGS  += -I$(CURDIR)/hal/include
-LDFLAGS := -lm -lpthread -lreadline -ldl
+LDFLAGS := -lm -lpthread -lreadline -ldl -lrt
 
 # Collect all source files
 KERNEL_SRCS := $(wildcard kernel/src/*.c)

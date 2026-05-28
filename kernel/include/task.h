@@ -60,6 +60,7 @@ void task_scheduler_tick(void);
 int task_get_tid(task_t *t);
 const char *task_get_name(task_t *t);
 void task_set_priority(task_t *t, int priority);
+void task_join_all(void);
 
 #ifdef __cplusplus
 }

@@ -2,128 +2,77 @@
 #include "task.h"
 #include "kernel_log.h"
 #include <string.h>
-#include <ucontext.h>
-#include <signal.h>
-#include <sys/time.h>
-#include <stddef.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/time.h>
+#include <sched.h>
 
 #define MAX_TASKS 32
 #define TICK_INTERVAL_MS 10
-#define DEFAULT_STACK_SIZE (64 * 1024)
 
-/* 任务节点 — 内含 TCB + ucontext + 栈 */
+/* 任务控制块 — 每个任务一个 POSIX 线程 */
 typedef struct task_node {
     task_t tcb;
-    ucontext_t ctx;
-    char stack[DEFAULT_STACK_SIZE];
+    pthread_t thread;
+    bool created;
+    bool running;
     struct task_node *next;
 } task_node_t;
 
-/* 就绪队列 — 每个优先级一个 */
-static task_node_t *s_ready_queues[TASK_PRIORITY_COUNT];
-static task_node_t *s_current_node = NULL;
+static task_node_t s_tasks[MAX_TASKS];
+static int s_task_count = 0;
 static task_t *s_current = NULL;
-static int s_next_tid = 1;
-static struct sigaction s_old_alarm;
+static pthread_key_t s_task_key;
+
 static bool s_scheduler_running = false;
 
-/* 阻塞 / 睡眠队列 */
-static task_node_t *s_sleeping_list = NULL;
-
-/* 空闲任务上下文 */
-static ucontext_t s_idle_ctx;
-static char s_idle_stack[DEFAULT_STACK_SIZE];
-
-/* 主上下文（rtos_start 调用者） */
-static ucontext_t s_main_ctx;
+/* Tick 相关 */
+static struct sigaction s_old_alarm;
+static volatile uint32_t s_tick_count = 0;
 
 /* --- 内部辅助 --- */
 
-static task_node_t *node_from_tcb(task_t *t)
+static task_node_t *find_node_by_thread(pthread_t thread)
 {
-    if (!t) return NULL;
-    return (task_node_t *)((char *)t - offsetof(task_node_t, tcb));
-}
-
-static void enqueue_ready(task_node_t *node)
-{
-    int prio = node->tcb.priority;
-    node->tcb.state = TASK_READY;
-    node->next = s_ready_queues[prio];
-    s_ready_queues[prio] = node;
-}
-
-static task_node_t *dequeue_highest(void)
-{
-    for (int p = TASK_PRIORITY_COUNT - 1; p >= 0; p--) {
-        if (s_ready_queues[p]) {
-            task_node_t *n = s_ready_queues[p];
-            s_ready_queues[p] = n->next;
-            n->tcb.state = TASK_RUNNING;
-            return n;
-        }
-    }
+    for (int i = 0; i < s_task_count; i++)
+        if (s_tasks[i].created && s_tasks[i].thread == thread)
+            return &s_tasks[i];
     return NULL;
 }
 
-static void enqueue_sleeping(task_node_t *node, uint32_t ticks)
+static void *task_wrapper(void *arg)
 {
-    node->tcb.sleep_ticks = ticks;
-    node->tcb.state = TASK_SLEEPING;
-    task_node_t **pp = &s_sleeping_list;
-    while (*pp)
-        pp = &(*pp)->next;
-    node->next = *pp;
-    *pp = node;
+    task_node_t *node = (task_node_t *)arg;
+    task_func_t func = (task_func_t)node->tcb.entry;
+    void *func_arg = node->tcb.arg;
+
+    /* 设置 TLS 指向当前 TCB */
+    pthread_setspecific(s_task_key, &node->tcb);
+    s_current = &node->tcb;
+
+    /* 调用用户任务函数 */
+    func(func_arg);
+
+    node->running = false;
+    node->tcb.state = TASK_TERMINATED;
+    return NULL;
 }
 
-/* 信号安全的上下文切换 */
-static void context_switch_to(task_node_t *next)
-{
-    if (!next) return;
-    task_node_t *prev = s_current_node;
-    s_current_node = next;
-    s_current = &next->tcb;
-
-    if (prev && prev != next) {
-        swapcontext(&prev->ctx, &next->ctx);
-    } else {
-        setcontext(&next->ctx);
-    }
-}
-
-/* 调度决策 */
-static void schedule(void)
-{
-    if (!s_scheduler_running) return;
-    task_node_t *next = dequeue_highest();
-    if (!next) return;
-
-    if (s_current_node && s_current_node->tcb.state == TASK_RUNNING) {
-        enqueue_ready(s_current_node);
-    }
-    context_switch_to(next);
-}
+/* --- 调度器管理 --- */
 
 void task_scheduler_init(void)
 {
-    memset(s_ready_queues, 0, sizeof(s_ready_queues));
-    LOG_INFO("Task scheduler initialized");
+    pthread_key_create(&s_task_key, NULL);
+    memset(s_tasks, 0, sizeof(s_tasks));
+    LOG_INFO("Task scheduler initialized (pthread-based)");
 }
 
 static void scheduler_tick_handler(int sig)
 {
     (void)sig;
-    if (s_scheduler_running)
-        task_scheduler_tick();
-}
-
-static void idle_task(void *arg)
-{
-    (void)arg;
-    while (1) task_yield();
+    s_tick_count++;
 }
 
 void task_scheduler_start(void)
@@ -131,16 +80,9 @@ void task_scheduler_start(void)
     struct itimerval it;
     struct sigaction sa;
 
-    /* 创建空闲任务 */
-    getcontext(&s_idle_ctx);
-    s_idle_ctx.uc_stack.ss_sp = s_idle_stack;
-    s_idle_ctx.uc_stack.ss_size = sizeof(s_idle_stack);
-    s_idle_ctx.uc_link = NULL;
-    makecontext(&s_idle_ctx, (void (*)(void))idle_task, 1, NULL);
-
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = scheduler_tick_handler;
-    sa.sa_flags = SA_RESTART | SA_NODEFER;
+    sa.sa_flags = SA_RESTART;
     sigaction(SIGALRM, &sa, &s_old_alarm);
 
     it.it_value.tv_sec = 0;
@@ -151,49 +93,11 @@ void task_scheduler_start(void)
 
     s_scheduler_running = true;
     LOG_INFO("Scheduler starting with %d ms tick", TICK_INTERVAL_MS);
-
-    /* 运行第一个任务 */
-    task_node_t *first = dequeue_highest();
-    if (first) {
-        s_current_node = first;
-        s_current = &first->tcb;
-        swapcontext(&s_main_ctx, &first->ctx);
-    } else {
-        swapcontext(&s_main_ctx, &s_idle_ctx);
-    }
 }
 
 void task_scheduler_tick(void)
 {
-    if (!s_scheduler_running) return;
-    if (s_current_node)
-        s_current_node->tcb.time_ticks++;
-
-    /* 唤醒睡眠任务 */
-    task_node_t **pp = &s_sleeping_list;
-    while (*pp) {
-        if ((*pp)->tcb.sleep_ticks > 0)
-            (*pp)->tcb.sleep_ticks--;
-        if ((*pp)->tcb.sleep_ticks == 0) {
-            task_node_t *wake = *pp;
-            *pp = wake->next;
-            enqueue_ready(wake);
-        } else {
-            pp = &(*pp)->next;
-        }
-    }
-
-    /* 抢占式：相同优先级时间片轮转 */
-    if (s_current_node && s_current_node->tcb.state == TASK_RUNNING) {
-        enqueue_ready(s_current_node);
-        task_node_t *next = dequeue_highest();
-        if (next && next != s_current_node) {
-            context_switch_to(next);
-        } else if (next) {
-            /* 没有其他任务，放回去继续运行 */
-            enqueue_ready(s_current_node);
-        }
-    }
+    /* 统计 tick — 实际调度由 pthread 调度器处理 */
 }
 
 /* --- 公开 API --- */
@@ -201,73 +105,96 @@ void task_scheduler_tick(void)
 task_t *task_create(const char *name, task_func_t func, void *arg,
                     size_t stack_size, int priority)
 {
+    if (s_task_count >= MAX_TASKS) return NULL;
     if (priority < 0 || priority >= TASK_PRIORITY_COUNT)
         priority = TASK_PRIORITY_NORMAL;
-    if (stack_size < 1024) stack_size = DEFAULT_STACK_SIZE;
+    if (stack_size < 4096) stack_size = 64 * 1024;
 
-    task_node_t *node = calloc(1, sizeof(task_node_t));
-    if (!node) return NULL;
+    task_node_t *node = &s_tasks[s_task_count];
+    memset(node, 0, sizeof(*node));
 
     strncpy(node->tcb.name, name ? name : "task", sizeof(node->tcb.name) - 1);
-    node->tcb.tid = s_next_tid++;
     node->tcb.priority = priority;
     node->tcb.base_priority = priority;
-    node->tcb.state = TASK_READY;
-    node->tcb.stack_size = stack_size;
+    node->tcb.state = TASK_RUNNING;
+    node->tcb.entry = (void *)func;
+    node->tcb.arg = arg;
+    node->tcb.tid = s_task_count + 1;
+    node->running = true;
+    node->created = true;
 
-    /* 设置 ucontext */
-    getcontext(&node->ctx);
-    node->ctx.uc_stack.ss_sp = node->stack;
-    node->ctx.uc_stack.ss_size = sizeof(node->stack);
-    node->ctx.uc_link = &s_idle_ctx;
-    makecontext(&node->ctx, (void (*)(void))func, 1, arg);
+    /* 创建 pthread */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, stack_size);
 
-    enqueue_ready(node);
+    if (priority > TASK_PRIORITY_NORMAL) {
+        struct sched_param param;
+        param.sched_priority = 10 + priority;
+        pthread_attr_setschedpolicy(&attr, SCHED_RR);
+        pthread_attr_setschedparam(&attr, &param);
+    }
 
-    LOG_INFO("task_create: %s (tid=%d, prio=%d)",
-             node->tcb.name, node->tcb.tid, priority);
+    int ret = pthread_create(&node->thread, &attr, task_wrapper, node);
+    pthread_attr_destroy(&attr);
+
+    if (ret != 0) {
+        LOG_ERROR("task_create: pthread_create failed for %s (err=%d)", name, ret);
+        node->created = false;
+        return NULL;
+    }
+
+    s_task_count++;
+    LOG_INFO("task_create: %s (tid=%d, prio=%d)", name, node->tcb.tid, priority);
     return &node->tcb;
 }
 
 void task_destroy(task_t *task)
 {
     if (!task) return;
-    node_from_tcb(task)->tcb.state = TASK_TERMINATED;
-    free(node_from_tcb(task));
+    /* 实际清理在线程退出时自动完成 */
 }
 
 void task_yield(void)
 {
-    if (!s_scheduler_running || !s_current_node) return;
-    schedule();
+    /* pthread 版本的 yield 让出 CPU */
+    sched_yield();
 }
 
 void task_sleep(uint32_t ms)
 {
-    if (!s_current_node) return;
-    uint32_t ticks = (ms + TICK_INTERVAL_MS - 1) / TICK_INTERVAL_MS;
-    if (ticks == 0) ticks = 1;
-    enqueue_sleeping(s_current_node, ticks);
-    s_current_node = NULL;
-    s_current = NULL;
-    schedule();
+    usleep(ms * 1000);
 }
 
 void task_exit(void)
 {
-    if (s_current_node) {
-        s_current_node->tcb.state = TASK_TERMINATED;
-        s_current_node = NULL;
-        s_current = NULL;
+    task_node_t *node = find_node_by_thread(pthread_self());
+    if (node) {
+        node->running = false;
+        node->tcb.state = TASK_TERMINATED;
     }
-    schedule();
+    pthread_exit(NULL);
 }
 
 task_t *task_self(void)
 {
-    return s_current;
+    task_t *t = (task_t *)pthread_getspecific(s_task_key);
+    if (!t) {
+        /* 主线程调用 */
+        return NULL;
+    }
+    return t;
 }
 
-int task_get_tid(task_t *t) { return t ? t->tid : -1; }
-const char *task_get_name(task_t *t) { return t ? t->name : "none"; }
+int task_get_tid(task_t *t) { return t ? t->tid : 0; }
+const char *task_get_name(task_t *t) { return t ? t->name : "main"; }
 void task_set_priority(task_t *t, int priority) { if (t) t->priority = priority; }
+
+/* 等待所有任务结束 */
+void task_join_all(void)
+{
+    for (int i = 0; i < s_task_count; i++) {
+        if (s_tasks[i].created)
+            pthread_join(s_tasks[i].thread, NULL);
+    }
+}

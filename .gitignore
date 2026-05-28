@@ -1,0 +1,14 @@
+# Build outputs
+*.o
+*.elf
+*.a
+*.so
+
+# Editor
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

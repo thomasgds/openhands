@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include <libssh2.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -140,7 +141,6 @@ static int cmd_ssh(int argc, char **argv)
     char user[128] = "root";
     char host[256];
     int port = 22;
-    char pass[256] = "";
     const char *cmd = NULL;
 
     /* 解析 user@host[:port] */
@@ -172,14 +172,39 @@ static int cmd_ssh(int argc, char **argv)
         cmd = argv[2];
     }
 
-    /* 尝试从环境变量或默认密码 */
+    /* 密码：优先环境变量 SSH_PASS，其次从 stdin 交互读取 */
+    char pass[256] = "";
     char *env_pass = getenv("SSH_PASS");
-    if (env_pass) {
+    if (env_pass && env_pass[0]) {
         strncpy(pass, env_pass, sizeof(pass) - 1);
     } else {
-        /* 默认密码（主要用于演示/测试环境） */
-        const char *default_pass = "root";
-        strncpy(pass, default_pass, sizeof(pass) - 1);
+        /* 隐藏终端读密码 */
+        printf("Password for %s@%s: ", user, host);
+        fflush(stdout);
+        FILE *tty = fopen("/dev/tty", "r");
+        if (tty) {
+            /* 关闭回显 */
+            system("stty -echo < /dev/tty 2>/dev/null");
+
+            if (fgets(pass, sizeof(pass), tty)) {
+                size_t plen = strlen(pass);
+                if (plen > 0 && pass[plen - 1] == '\n')
+                    pass[plen - 1] = '\0';
+            }
+
+            /* 恢复回显 */
+            system("stty echo < /dev/tty 2>/dev/null");
+            fclose(tty);
+        } else {
+            /* 回退：直接从 stdin 读 */
+            printf("\n");
+            if (fgets(pass, sizeof(pass), stdin)) {
+                size_t plen = strlen(pass);
+                if (plen > 0 && pass[plen - 1] == '\n')
+                    pass[plen - 1] = '\0';
+            }
+        }
+        printf("\n");
     }
 
     printf("Connecting to %s@%s:%d ...\n", user, host, port);

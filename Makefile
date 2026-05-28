@@ -2,7 +2,7 @@
 # RTOS Project - Top-level Makefile
 #
 CC      := gcc
-CFLAGS  := -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function -fPIC -g -O0
+CFLAGS  := -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-function -Wno-format-truncation -fPIC -g -O0
 CFLAGS  += -I$(CURDIR)/kernel/include
 CFLAGS  += -I$(CURDIR)/fs/include
 CFLAGS  += -I$(CURDIR)/fatfs/include

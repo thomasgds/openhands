@@ -1,17 +1,21 @@
 #include "telnetd.h"
 #include "kernel_log.h"
 #include "task.h"
+#include "shell.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <errno.h>
 
 #define TELNET_PORT 23
 #define TELNET_BACKLOG 5
+#define TELNET_BUF_SIZE 4096
 
 static int s_telnet_fd = -1;
 static bool s_telnet_running = false;
@@ -33,17 +37,55 @@ static void telnet_negotiate(int fd)
     write(fd, opt, sizeof(opt));
 }
 
+/* Telnet 输出重定向：用 dup2+pipe 方案 */
+static int s_telnet_pipe_fds[2] = {-1, -1};
+static pthread_mutex_t s_telnet_output_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 转发输出线程：从 pipe 读 stdout 数据，写到 telnet 客户端 */
+static void telnet_output_forward(void *arg)
+{
+    int client_fd = (int)(intptr_t)arg;
+    char buf[1024];
+    while (1) {
+        int n = read(s_telnet_pipe_fds[0], buf, sizeof(buf));
+        if (n <= 0) break;
+        pthread_mutex_lock(&s_telnet_output_lock);
+        /* 将 \n 转为 \r\n */
+        for (int i = 0; i < n; i++) {
+            if (buf[i] == '\n')
+                write(client_fd, "\r\n", 2);
+            else if (buf[i] != '\r')
+                write(client_fd, &buf[i], 1);
+        }
+        pthread_mutex_unlock(&s_telnet_output_lock);
+    }
+    task_exit();
+}
+
 static void telnet_session(void *arg)
 {
     int client_fd = (int)(intptr_t)arg;
     char buf[512];
-    char cmd[256];
+    char cmd[512];
     int cmd_pos = 0;
+    int saved_stdout = -1;
 
     telnet_negotiate(client_fd);
 
-    const char *banner = "\r\nRTOS Telnet Server\r\n"
-                         "Type 'help' for commands\r\n"
+    /* 创建 pipe，重定向 stdout 到写端 */
+    if (s_telnet_pipe_fds[0] < 0) {
+        pipe(s_telnet_pipe_fds);
+    }
+    saved_stdout = dup(STDOUT_FILENO);
+
+    /* 启动输出转发线程 */
+    task_create("telnet_fwd", telnet_output_forward, (void *)(intptr_t)client_fd,
+                0, TASK_PRIORITY_NORMAL);
+
+    const char *banner = "\r\n====================================\r\n"
+                         "  RTOS Telnet Remote Shell\r\n"
+                         "  Type 'help' for commands\r\n"
+                         "====================================\r\n"
                          "rtos> ";
     write(client_fd, banner, strlen(banner));
 
@@ -55,32 +97,53 @@ static void telnet_session(void *arg)
             unsigned char c = (unsigned char)buf[i];
 
             if (c == TELNET_IAC) {
-                /* Telnet 命令 — 跳过 */
-                if (i + 2 < n) i += 2;
+                /* Telnet 命令 — 跳过后续两个字节 */
+                i += 2;
                 continue;
             }
 
             if (c == '\r') continue;
-            if (c == '\n') {
+
+            if (c == '\n' || c == '\0') {
                 cmd[cmd_pos] = '\0';
+
                 if (cmd_pos > 0) {
-                    /* 执行命令（通过 shell_execute） */
-                    char response[512];
-                    int rlen = snprintf(response, sizeof(response),
-                                        "\r\nExecuting: %s\r\n", cmd);
-                    write(client_fd, response, rlen);
+                    write(client_fd, "\r\n", 2);
+
+                    /* 执行命令前重定向 stdout 到 pipe */
+                    if (s_telnet_pipe_fds[1] >= 0)
+                        dup2(s_telnet_pipe_fds[1], STDOUT_FILENO);
+
+                    shell_execute(cmd);
+
+                    /* 恢复 stdout */
+                    if (saved_stdout >= 0)
+                        dup2(saved_stdout, STDOUT_FILENO);
+
+                    write(client_fd, "\r\n", 2);
                 }
-                write(client_fd, "\r\nrtos> ", 8);
+
+                write(client_fd, "rtos> ", 6);
                 cmd_pos = 0;
             } else if (c == 127 || c == '\b') {
-                if (cmd_pos > 0) cmd_pos--;
+                if (cmd_pos > 0) {
+                    cmd_pos--;
+                    write(client_fd, "\b \b", 3);
+                }
             } else if (cmd_pos < (int)sizeof(cmd) - 1) {
                 cmd[cmd_pos++] = c;
+                write(client_fd, &c, 1);
             }
         }
     }
 
+    /* 清理 */
+    if (saved_stdout >= 0) {
+        dup2(saved_stdout, STDOUT_FILENO);
+        close(saved_stdout);
+    }
     close(client_fd);
+    LOG_INFO("Telnet session closed");
     task_exit();
 }
 
